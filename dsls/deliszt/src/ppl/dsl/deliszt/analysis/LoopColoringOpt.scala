@@ -21,7 +21,8 @@ trait LoopColoringOpsExp extends BaseFatExp with EffectExp { this: DeLisztExp =>
     // an effect in a more specific scope, it gains the more specific Type manifest, which we don't want in this case.
     
     // we could also probably use remap to fix this, but I didn't want to disturb anything else.
-    reflectEffect(ColorIndexSetNew(Array(indices: _*),unit(start),unit(end),mo))(baseManifest(mo.typeArguments(0).asInstanceOf[Manifest[MeshObj]]))
+    //reflectEffect(ColorIndexSetNew(Array(indices: _*),unit(start),unit(end),mo))(baseManifest(mo.typeArguments(0).asInstanceOf[Manifest[MeshObj]]))
+    ColorIndexSetNew(Array(indices: _*),unit(start),unit(end),mo)
   }
   def color_lift(x: Int) = Const(x)
 }

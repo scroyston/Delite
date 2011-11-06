@@ -1,11 +1,37 @@
 package ppl.delite.framework.ops
 
-import ppl.delite.framework.datastruct.scala.DeliteCollection
 import java.io.PrintWriter
 import scala.virtualization.lms.common.{EffectExp, BaseFatExp, Base, ScalaGenFat, CudaGenEffect, OpenCLGenEffect}
 import scala.virtualization.lms.internal.{GenericFatCodegen}
+import scala.reflect.SourceContext
+
+//trait DeliteCollection[+A]
+
+package object ops {
+  type DeliteCollection[A] = ppl.delite.framework.datastruct.scala.DeliteCollection[A]
+}
 
 trait DeliteCollectionOps extends Base {
+  trait DCInterfaceOps[+T,A] extends InterfaceOps[T] {
+    def dcSize: Rep[Int] 
+    def dcApply(n: Rep[Int]): Rep[A] 
+    def dcUpdate(n: Rep[Int], y: Rep[A]): Rep[Unit]
+  }
+
+  trait DCInterface[+T,A] extends Interface[T] {
+    val ops: DCInterfaceOps[T,A]
+  }
+  
+  implicit def interfaceToDCOps[A:Manifest](intf: Interface[DeliteCollection[A]]) = new DeliteCollectionInterfaceOps(intf.asInstanceOf[DCInterface[DeliteCollection[A],A]])
+  
+  // unlike before, don't assume that we know how to generate dcSize,dcApply,dcUpdate at run-time
+  class DeliteCollectionInterfaceOps[A:Manifest](val intf: DCInterface[DeliteCollection[A],A]) {
+    def dcSize = intf.ops.dcSize
+    def dcApply(n: Rep[Int]) = intf.ops.dcApply(n) 
+    def dcUpdate(n: Rep[Int], y: Rep[A]) = intf.ops.dcUpdate(n,y)
+  }
+  
+  // TODO -- AKS OLD: remove after refactor is complete
   implicit def dcToDcOps[A:Manifest](x: Rep[DeliteCollection[A]]) = new deliteCollectionOpsCls(x)
   
   class deliteCollectionOpsCls[A:Manifest](x: Rep[DeliteCollection[A]]) {
@@ -25,6 +51,9 @@ trait DeliteCollectionOpsExp extends DeliteCollectionOps with BaseFatExp with Ef
     def mA = manifest[A]
   }
   case class DeliteCollectionUpdate[A:Manifest](x: Exp[DeliteCollection[A]], n: Exp[Int], y: Exp[A]) extends Def[Unit]
+  case class DeliteCollectionUnsafeSetData[A:Manifest](x: Exp[DeliteCollection[A]], d: Exp[DeliteArray[A]]) extends Def[Unit] { // legacy...
+    def m = manifest[A]
+  }
 
   def dc_size[A:Manifest](x: Exp[DeliteCollection[A]]) = x match { // TODO: move to Opt trait ?
     case Def(e: DeliteOpMap[_,_,_]) => e.size
@@ -32,18 +61,24 @@ trait DeliteCollectionOpsExp extends DeliteCollectionOps with BaseFatExp with Ef
     //case Def(Reflect(e: DeliteOpMap[_,_,_], _,_)) => e.size // reasonable?
     //case Def(Reflect(e: DeliteOpZipWith[_,_,_,_], _,_)) => e.size // reasonable?
     case _ => reflectPure(DeliteCollectionSize(x))
+    // TODO case _ => throw new RuntimeException("no static implementation found for dc_size on " + findDefinition(x.asInstanceOf[Sym[DeliteCollection[A]]]).get)
   }
-  def dc_apply[A:Manifest](x: Exp[DeliteCollection[A]], n: Exp[Int]) = reflectPure(DeliteCollectionApply(x,n))
-  def dc_update[A:Manifest](x: Exp[DeliteCollection[A]], n: Exp[Int], y: Exp[A]) = reflectWrite(x)(DeliteCollectionUpdate(x,n,y))
+  def dc_apply[A:Manifest](x: Exp[DeliteCollection[A]], n: Exp[Int]): Exp[A] = reflectPure(DeliteCollectionApply(x,n))//throw new RuntimeException("no static implementation found for dc_apply on " + findDefinition(x.asInstanceOf[Sym[DeliteCollection[A]]]).get + " --- x.Type is " + x.Type)
+  def dc_update[A:Manifest](x: Exp[DeliteCollection[A]], n: Exp[Int], y: Exp[A]): Exp[Unit] = reflectWrite(x)(DeliteCollectionUpdate(x,n,y))//throw new RuntimeException("no static implementation found for dc_update on " + findDefinition(x.asInstanceOf[Sym[DeliteCollection[A]]]).get) 
+
+  def dc_unsafeSetData[A:Manifest](x: Exp[DeliteCollection[A]], d: Exp[DeliteArray[A]]) = reflectWrite(x)(DeliteCollectionUnsafeSetData(x,d)) // legacy...
+
 
   //////////////
   // mirroring
 
-  override def mirror[A:Manifest](e: Def[A], f: Transformer): Exp[A] = (e match {
+  override def mirror[A:Manifest](e: Def[A], f: Transformer)(implicit ctx: SourceContext): Exp[A] = (e match {
     case e@DeliteCollectionApply(x, n) => dc_apply(f(x), f(n))(e.mA)
     case DeliteCollectionSize(x) => dc_size(f(x))
     case Reflect(e@DeliteCollectionApply(l,r), u, es) => reflectMirrored(Reflect(DeliteCollectionApply(f(l),f(r))(e.mA), mapOver(f,u), f(es)))(mtype(manifest[A]))
     case Reflect(DeliteCollectionSize(l), u, es) => reflectMirrored(Reflect(DeliteCollectionSize(f(l)), mapOver(f,u), f(es)))(mtype(manifest[A]))
+    case Reflect(DeliteCollectionUpdate(l,i,r), u, es) => reflectMirrored(Reflect(DeliteCollectionUpdate(f(l),f(i),f(r)), mapOver(f,u), f(es)))(mtype(manifest[A]))
+    case Reflect(dc@DeliteCollectionUnsafeSetData(x, d), u, es) => reflectMirrored(Reflect(DeliteCollectionUnsafeSetData(f(x),f(d))(dc.m), mapOver(f,u), f(es)))(mtype(manifest[Unit]))
     case _ => super.mirror(e, f)
   }).asInstanceOf[Exp[A]]
   
@@ -96,7 +131,8 @@ trait ScalaGenDeliteCollectionOps extends BaseGenDeliteCollectionOps with ScalaG
     rhs match {
       case DeliteCollectionSize(x) => emitValDef(sym, quote(x) + ".dcSize")
       case DeliteCollectionApply(x,n) => emitValDef(sym, quote(getBlockResult(x)) + ".dcApply(" + quote(n) + ")")
-      case DeliteCollectionUpdate(x,n,y) => emitValDef(sym, quote(getBlockResult(x)) + ".dcUpdate(" + quote(n) + "," + quote(getBlockResult(y)) + ")")
+      case DeliteCollectionUpdate(x,n,y) => emitValDef(sym, quote(getBlockResult(x)) + ".dcUpdate(" + quote(n) + "," + quote(y) + ")")
+      case DeliteCollectionUnsafeSetData(x,d) => emitValDef(sym, quote(getBlockResult(x)) + ".unsafeSetData(" + quote(d) + "," + quote(d) + ".length)")
       case _ => super.emitNode(sym, rhs)
     }
 
@@ -111,8 +147,9 @@ trait CudaGenDeliteCollectionOps extends BaseGenDeliteCollectionOps with CudaGen
     rhs match {
       case DeliteCollectionSize(x) => emitValDef(sym, quote(x) + ".dcSize()")
       case DeliteCollectionApply(x,n) => emitValDef(sym, quote(getBlockResult(x)) + ".dcApply(" + quote(n) + ")")
-      //case DeliteCollectionUpdate(x,n,y) => emitValDef(sym, quote(getBlockResult(x)) + ".dcUpdate(" + quote(n) + "," + quote(getBlockResult(y)) + ")")
-      case DeliteCollectionUpdate(x,n,y) => stream.println(quote(getBlockResult(x)) + ".dcUpdate(" + quote(n) + "," + quote(getBlockResult(y)) + ");")
+      //case DeliteCollectionUpdate(x,n,y) => emitValDef(sym, quote(getBlockResult(x)) + ".dcUpdate(" + quote(n) + "," + quote(y) + ")")
+      case DeliteCollectionUpdate(x,n,y) => stream.println(quote(getBlockResult(x)) + ".dcUpdate(" + quote(n) + "," + quote(y) + ");")
+      case DeliteCollectionUnsafeSetData(x,d) => emitValDef(sym, quote(getBlockResult(x)) + ".unsafeSetData(" + quote(d) + "," + quote(d) + ".length)")
       case _ => super.emitNode(sym, rhs)
     }
   }

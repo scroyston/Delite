@@ -35,7 +35,6 @@ trait DeliteApplication extends DeliteOpsExp with ScalaCompile {
 
   val generators: List[GenericFatCodegen{ val IR: DeliteApplication.this.type }] = targets.reverse.map(getCodeGenPkg(_))
 
-
   // TODO: refactor, this is from ScalaCompile trait
   lazy val codegen: ScalaCodegen { val IR: DeliteApplication.this.type } = 
     getCodeGenPkg(scalaTarget).asInstanceOf[ScalaCodegen { val IR: DeliteApplication.this.type }]
@@ -50,6 +49,9 @@ trait DeliteApplication extends DeliteOpsExp with ScalaCompile {
   val analysisResults = MMap[String,Any]()
 
   var args: Rep[Array[String]] = _
+
+  var staticDataMap: Map[String,_] = _
+
   
   final def main(args: Array[String]) {
     println("Delite Application Being Staged:[" + this.getClass.getSimpleName + "]")
@@ -89,16 +91,7 @@ trait DeliteApplication extends DeliteOpsExp with ScalaCompile {
     reset
     
     System.out.println("Now printing")
-    
-    deliteGenerator.emitDataStructures(Config.buildDir + File.separator)
-
-    for (g <- generators) {
-      val baseDir = Config.buildDir + File.separator + g.toString + File.separator
-      writeModules(baseDir)
-      g.emitDataStructures(baseDir + "datastructures" + File.separator)
-      g.initializeGenerator(baseDir + "kernels" + File.separator, args, analysisResults)
-    }
-    
+        
     if (Config.degFilename.endsWith(".deg")) {
       val streamScala = new PrintWriter(new FileWriter(Config.degFilename.replace(".deg",".scala")))
       val baseDir = Config.buildDir + File.separator + codegen.toString + File.separator
@@ -109,17 +102,29 @@ trait DeliteApplication extends DeliteOpsExp with ScalaCompile {
     }
     
     deliteGenerator.initializeGenerator(Config.buildDir, args, analysisResults)
-    deliteGenerator.emitSource(liftedMain, "Application", stream)
-    deliteGenerator.finalizeGenerator()
-
+    val sd = deliteGenerator.emitSource(liftedMain, "Application", stream)
+    deliteGenerator.emitDataStructures(Config.buildDir + File.separator)    
+    
     if(Config.printGlobals) {
       println("Global definitions")
       for(globalDef <- globalDefs) {
         println(globalDef)
       }
     }
-
-    generators foreach { _.finalizeGenerator()}
+    
+    for (g <- generators) {
+      val baseDir = Config.buildDir + File.separator + g.toString + File.separator
+      writeModules(baseDir)
+      g.emitDataStructures(baseDir + "datastructures" + File.separator)
+      g.initializeGenerator(baseDir + "kernels" + File.separator, args, analysisResults)
+    }
+    
+    deliteGenerator.finalizeGenerator()
+    generators foreach { _.finalizeGenerator()}    
+    
+    staticDataMap = Map() ++ sd map { case (s,d) => (deliteGenerator.quote(s), d) }
+    
+    
   }
 
   final def generateScalaSource(name: String, stream: PrintWriter) = {
@@ -143,8 +148,6 @@ trait DeliteApplication extends DeliteOpsExp with ScalaCompile {
     val g = compile(liftedMain)
     g(args)
   }
-
-  def registerDSLType(name: String): DSLTypeRepresentation = nop
 
   /**
    * this is the entry method for our applications, user implement this method. Note, that it is missing the

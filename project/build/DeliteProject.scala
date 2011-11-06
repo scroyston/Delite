@@ -74,29 +74,37 @@ final class DeliteProject(info: ProjectInfo) extends DefaultProject(info) with M
   // Define projects
   lazy val framework = project("framework", "Delite Framework", new FlatProject(_))  
 
-  //HC: We should not include runtime here as it is compiled with release versions of Scala.
-  //lazy val runtime = project("runtime", "Delite Runtime", new FlatProject(_) {
-  //  override def mainClass = Some("ppl.delite.runtime.Delite")
-  //})
+  // TR: interop requires runtime being built and run using the same scala version as everything else.
+  lazy val runtime = project("runtime", "Delite Runtime", new FlatProject(_) {
+    override def mainClass = Some("ppl.delite.runtime.Delite")
+  })
 
   class DSLs(info: ProjectInfo) extends DefaultProject(info) {
-    lazy val optiml = project("optiml", "OptiML", new FlatProject(_){
-      override def mainClass = Some("ppl.dsl.tests.SimpleVectorTest")
+    //lazy val optila = project("optila", "OptiLA", new FlatProject(_), framework)
+
+    //lazy val optiml = project("optiml", "OptiML", new FlatProject(_){
+    //}, framework,optila)
+
+    lazy val simple = project("simple", "Simple", new FlatProject(_){
+      override def mainClass = Some("ppl.apps.assignment2.SimpleVectorAppRunner")
     }, framework)
-    lazy val optiql = project("optiql", "OptiQL", new OptiQLProject(_), framework)
     
     class DeLisztProject(info: ProjectInfo) extends FlatProject(info) {
       val lift_json = "net.liftweb" % "lift-json_2.9.0" % "2.4-SNAPSHOT"
     }
     lazy val deliszt = project("deliszt", "DeLiszt", new DeLisztProject(_), framework)
+    
+    //lazy val profiling = project("profiling", "Profiling", new FlatProject(_), framework)
+    //lazy val collections = project("collections", "Collections", new FlatProject(_), framework, optila)
+    //lazy val optiql = project("optiql", "OptiQL", new OptiQLProject(_), framework,collections)
   }
-
+  
   lazy val dsls = project("dsls", "DSLs", new DSLs(_), framework)
 
-  lazy val apps = project("apps", "Applications", new APPs(_), framework, dsls)
+  //lazy val apps = project("apps", "Applications", new APPs(_), framework, dsls)
   class APPs(info: ProjectInfo) extends DefaultProject(info) {
 	  lazy val scala = project("scala", "Scala Apps", new FlatProject(_), framework, dsls)
-    override def compileOptions = CompileOption("-Xprint:typer -Ydebug -Ylog:typer") :: super.compileOptions.toList    
+//    override def compileOptions = CompileOption("-Xprint:typer -Ydebug -Ylog:typer") :: super.compileOptions.toList    
   }
   
   //TR is anybody using this? conflict with defining 'tests' as test source path above...

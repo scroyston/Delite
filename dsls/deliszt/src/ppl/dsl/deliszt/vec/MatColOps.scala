@@ -1,14 +1,13 @@
 package ppl.dsl.deliszt.vec
 
 import java.io.PrintWriter
-import ppl.delite.framework.DSLType
 import scala.virtualization.lms.common._
 import scala.virtualization.lms.util.OverloadHack
 import ppl.dsl.deliszt.{DeLiszt, DeLisztExp}
 import ppl.dsl.deliszt._
 import ppl.dsl.deliszt.MetaInteger._
 
-trait MatColOps extends DSLType with Variables { this: DeLiszt =>
+trait MatColOps extends Variables { this: DeLiszt =>
   def infix_index[R<:IntM,A](x: Rep[MatCol[R,A]])(implicit mA: Manifest[A], o: Overloaded1) = matcol_index(x)
 
   // class defs

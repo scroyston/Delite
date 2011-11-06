@@ -3,13 +3,12 @@ package ppl.dsl.deliszt.meshset
 import java.io.PrintWriter
 import ppl.dsl.deliszt._
 
-import ppl.delite.framework.DSLType
 import reflect.Manifest
 import scala.virtualization.lms.common._
 import scala.virtualization.lms.internal.GenericFatCodegen
 import ppl.dsl.deliszt.{DeLisztExp, DeLiszt}
 
-trait MeshSetOps extends DSLType with Variables {
+trait MeshSetOps extends Variables {
   this: DeLiszt =>
 
   implicit def repMeshSetToMeshSetOps[MO <: MeshObj:Manifest](x: Rep[MeshSet[MO]]) = new meshSetOpsCls[MO](x)

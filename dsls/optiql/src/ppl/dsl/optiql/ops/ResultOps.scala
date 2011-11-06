@@ -9,7 +9,7 @@ trait ResultOps extends Base {
   
   class Result extends Row[Rep]
       
-  def __new[T<:Row[Rep]:Manifest](fields: (String, Rep[T] => Rep[_])*): Rep[T] = newResult[T](fields)
+  //def __new[T<:Row[Rep]:Manifest](fields: (String, Rep[T] => Rep[_])*): Rep[T] = newResult[T](fields)
     
   def newResult[T:Manifest](fields: Seq[(String,Rep[T] => Rep[_])]): Rep[T]
   

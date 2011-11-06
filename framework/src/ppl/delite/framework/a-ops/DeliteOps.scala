@@ -2,16 +2,19 @@ package ppl.delite.framework.ops
 
 import java.io.{FileWriter, File, PrintWriter}
 
+import scala.reflect.SourceContext
 import scala.virtualization.lms.common._
 import scala.virtualization.lms.internal.{GenericCodegen, GenericFatCodegen, GenerationFailedException}
-import ppl.delite.framework.datastruct.scala.DeliteCollection
+import ppl.delite.framework.datastructures.DeliteArrayOpsExp
 import ppl.delite.framework.Config
 import ppl.delite.framework.extern.lib._
+import ppl.delite.framework.collections.{EmitterFactory, ScalaEmitter}
+import ppl.delite.framework.datastruct.scala.Bucket
 
 //trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with LoopsFatExp {
 trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with LoopsFatExp with IfThenElseFatExp
-    with VariantsOpsExp with DeliteCollectionOpsExp
-    with OrderingOpsExp with CastingOpsExp with ImplicitOpsExp with WhileExp  {
+    with VariantsOpsExp with DeliteCollectionOpsExp with DeliteArrayOpsExp
+    with OrderingOpsExp with CastingOpsExp with ImplicitOpsExp with WhileExp with StaticDataExp {
   
   
 
@@ -51,10 +54,10 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
         if (a.productPrefix == b.productPrefix) {
           val r1 = a.productIterator.toList == b.productIterator.toList
           val r2 = syms(a) == syms(b)
-          val inMirror = Thread.currentThread.getStackTrace.exists(_.getMethodName == "mirror")
+          lazy val inMirror = Thread.currentThread.getStackTrace.exists(_.getMethodName == "mirror")
           //if (r1 != r2)
             //printdbg("?== "+this+","+x + " is "+r1+"/"+r2+" syms "+syms(a)+"/"+syms(b))
-          if (inMirror) r1 && r2 else r1
+          r1 && (!inMirror || r2)
         } else false
       case _ => super.equals(x)
     }
@@ -103,13 +106,49 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
     //cond: List[Exp[Boolean]] = Nil
   ) extends Def[Unit]
   
-  case class DeliteCollectElem[A, CA <: DeliteCollection[A]]( 
+  //case class DeliteCollectElem[A, CA <: DeliteCollection[A]]( 
+  // functions on CA currently happen at generation-time, and are not type-checked
+  case class DeliteCollectElem[A, CA]( 
+    aV: Sym[DeliteArray[A]],
     alloc: Exp[CA],
+    allocDataStructure: Exp[CA],
     func: Exp[A],
-    cond: List[Exp[Boolean]] = Nil
+    cond: List[Exp[Boolean]] = Nil,
+    emitterFactory: Option[EmitterFactory] = None
     // TODO: note that the alloc block right now directly references the size
     // which is not part of DeliteCollectElem instance. we might want to fix that 
-  ) extends Def[CA]
+  ) extends Def[CA] {
+    def needsCombine = emitterFactory.map(_.needsCombine).getOrElse(cond.nonEmpty)
+    def needsPostProcess = emitterFactory.map(_.needsPostProcess).getOrElse(cond.nonEmpty)
+    def needsPostProcess2 = emitterFactory.map(_.needsPostProcess2).getOrElse(false)
+    def needsSpecialCollect = emitterFactory.nonEmpty || cond.nonEmpty
+    def needsSpecialExtra = emitterFactory.nonEmpty || cond.nonEmpty
+    def needsSpecialInit = emitterFactory.nonEmpty || cond.nonEmpty
+    def emitterScala = emitterFactory.map(_.scala)
+  }
+
+  def elemType(elem: DeliteCollectElem[_,_]) = elem.aV.Type.typeArguments(0)
+  def elemType(elem: DeliteHashElem[_,_,_,_]) = manifest[Any] //KJB: hack to bypass struct logic for HashElem
+
+  case class DeliteHashElem[K, V1, V2, CR](
+    alloc: Exp[CR],
+    func: Exp[(K, V1)],
+    //inner: Def[V2], TODO
+    convertToV2: Exp[V2], // TODO
+    cond: List[Exp[Boolean]] = Nil,
+    emitterFactory: Option[EmitterFactory] = None
+    // TODO: note that the alloc block right now directly references the size
+    // which is not part of DeliteCollectElem instance. we might want to fix that
+  ) extends Def[CR] {
+    def needsCombine = emitterFactory.map(_.needsCombine).getOrElse(cond.nonEmpty)
+    def needsPostProcess = emitterFactory.map(_.needsPostProcess).getOrElse(cond.nonEmpty)
+    def needsPostProcess2 = emitterFactory.map(_.needsPostProcess2).getOrElse(false)
+    def needsSpecialCollect = emitterFactory.nonEmpty || cond.nonEmpty
+    def needsSpecialExtra = emitterFactory.nonEmpty || cond.nonEmpty
+    def needsSpecialInit = emitterFactory.nonEmpty || cond.nonEmpty
+    def emitterScala = emitterFactory.map(_.scala)
+  }
+
   
   case class DeliteReduceElem[A](
     func: Exp[A],
@@ -142,15 +181,22 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
   def loopBodyNeedsCombine[A](e: Def[A]) = e match {
     case e:DeliteReduceElem[_] => true
     case e:DeliteReduceTupleElem[_,_] => true
-    case e:DeliteCollectElem[_,_] => e.cond.nonEmpty
+    case e:DeliteCollectElem[_,_] => e.needsCombine
+    case e:DeliteHashElem[_,_,_,_] => e.needsCombine
     case _ => false
   }  
 
   def loopBodyNeedsPostProcess[A](e: Def[A]) = e match {
-    case e:DeliteCollectElem[_,_] => e.cond.nonEmpty
+    case e:DeliteCollectElem[_,_] => e.needsPostProcess
+    case e:DeliteHashElem[_,_,_,_] => e.needsPostProcess
     case _ => false
   }  
 
+  def loopBodyNeedsPostProcess2[A](e: Def[A]) = e match {
+    case e:DeliteCollectElem[_,_] => e.needsPostProcess2
+    case e:DeliteHashElem[_,_,_,_] => e.needsPostProcess2
+    case _ => false
+  }
   
   /**
    * A Conditional task - will emit a Conditional DEG node as well as kernels for the then and else clauses
@@ -203,7 +249,47 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
    *    if stripFirst is set to false, i.e. for a mutable reduction, then the zero value is used
    *    to allocate the accumulator, and it IS used in the initial reduction.
    */
+  
+  abstract class DeliteOpGroupBy[A: Manifest,
+                                 K: Manifest,
+                                 V: Manifest,
+                                 CA <: DeliteCollection[A]: Manifest,
+                                 CV <: DeliteCollection[V]: Manifest,
+                                 CR: Manifest]
+  extends DeliteOpLoop[CR] {
+    type OpType <: DeliteOpGroupBy[A, K, V, CA, CV, CR]
+    
+    // supplied by subclass
+    val in: Exp[DeliteCollection[A]]
+    //val size: Exp[Int] -- could be dc_size(in), but we want type-specific pattern matching to work
+    def func: Exp[A] => Exp[(K, V)]
+    def alloc: Exp[CR]
+    def emitterFactory: Option[EmitterFactory]
+    
+    def convertToCV: Exp[Bucket[V]] => Exp[CV]
+    
+    final lazy val vC: Sym[Bucket[V]] = copyTransformedOrElse(_.vC)(fresh[Bucket[V]]).asInstanceOf[Sym[Bucket[V]]]
+    
+    // loop
+    lazy val body: Def[CR] = copyBodyOrElse(DeliteHashElem[K,V,CV,CR](
+      alloc = reifyEffects(this.alloc),
+      func = reifyEffects(this.func(dc_apply(in, v))),
+      convertToV2 = reifyEffects(this.convertToCV(vC)),
+      emitterFactory = emitterFactory
+    ))
+  }
+  
 
+  abstract class DeliteOpMapLike[A:Manifest, CA:Manifest] extends DeliteOpLoop[CA] {
+    type OpType <: DeliteOpMapLike[A,CA]
+
+     def alloc: Exp[CA]
+     def allocWithArray: Exp[DeliteArray[A]] => Exp[CA] = { data => val res = alloc; dc_unsafeSetData(res.asInstanceOf[Exp[DeliteCollection[A]]], data); res }
+     def emitterFactory: Option[EmitterFactory] = None
+     
+     //final lazy val allocVal: Exp[CA] = copyTransformedOrElse(_.allocVal)(reifyEffects(alloc))
+     final lazy val aV: Sym[DeliteArray[A]] = copyTransformedOrElse(_.aV)(fresh[DeliteArray[A]]).asInstanceOf[Sym[DeliteArray[A]]]
+   }
 
   /**
    * Parallel map from DeliteCollection[A] => DeliteCollection[B]. Input functions can depend on free
@@ -216,8 +302,8 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
    *               the operation is mutable; (=> DeliteCollection[B]).
    */ 
   abstract class DeliteOpMap[A:Manifest,
-                             B:Manifest, CB <: DeliteCollection[B]:Manifest]
-    extends DeliteOpLoop[CB] {
+                             B:Manifest, CB:Manifest]
+    extends DeliteOpMapLike[B,CB] {
     type OpType <: DeliteOpMap[A,B,CB]
 
     // supplied by subclass
@@ -228,20 +314,22 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
 
     // loop
     lazy val body: Def[CB] = copyBodyOrElse(DeliteCollectElem[B, CB](
-      alloc = reifyEffects(this.alloc),
-      func = reifyEffects(this.func(dc_apply(in,v)))
+      aV = this.aV,
+      alloc = reifyEffects(this.allocWithArray(aV)),
+      allocDataStructure = reifyEffects(this.alloc),
+      func = reifyEffects(this.func(dc_apply(in, v))),
+      emitterFactory = emitterFactory
     ))
   }
+  
 
   /**
    *  Currently conditionally appends values to buffers, which are concatenated in the combine stage.
    *  Note that it is also implicitly a Map-Filter (it accepts a mapping function). Should this be renamed? 
-   *  
-   *  Should eventually be implemented as a parallel scan.
    */
   abstract class DeliteOpFilter[A:Manifest,
-                                B:Manifest, CB <: DeliteCollection[B]:Manifest]
-    extends DeliteOpLoop[CB] {
+                                B:Manifest, CB:Manifest]
+    extends DeliteOpMapLike[B,CB] {
     type OpType <: DeliteOpFilter[A,B,CB]
 
     // supplied by subclass
@@ -253,12 +341,14 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
 
     // loop
     lazy val body: Def[CB] = copyBodyOrElse(DeliteCollectElem[B, CB](
-      alloc = reifyEffects(this.alloc),
+      aV = this.aV,
+      alloc = reifyEffects(this.allocWithArray(aV)),
+      allocDataStructure = reifyEffects(this.alloc),
       func = reifyEffects(this.func(dc_apply(in,v))),
-      cond = reifyEffects(this.cond(dc_apply(in,v)))::Nil
+      cond = reifyEffects(this.cond(dc_apply(in,v)))::Nil,
+      emitterFactory = emitterFactory
     ))
   }  
-  
   
   
   /**
@@ -275,8 +365,8 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
    */
   abstract class DeliteOpZipWith[A:Manifest,
                                  B:Manifest,
-                                 R:Manifest, CR <: DeliteCollection[R]:Manifest]
-    extends DeliteOpLoop[CR] {
+                                 R:Manifest, CR:Manifest]
+    extends DeliteOpMapLike[R,CR] {
     type OpType <: DeliteOpZipWith[A,B,R,CR]
       
     // supplied by subclass   
@@ -287,11 +377,14 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
     
     // loop
     lazy val body: Def[CR] = copyBodyOrElse(DeliteCollectElem[R, CR](
-      alloc = reifyEffects(this.alloc),
-      func = reifyEffects(this.func(dc_apply(inA,v), dc_apply(inB,v)))
+      aV = this.aV,
+      alloc = reifyEffects(this.allocWithArray(aV)),
+      allocDataStructure = reifyEffects(this.alloc),
+      func = reifyEffects(this.func(dc_apply(inA,v), dc_apply(inB,v))),
+      emitterFactory = None
     ))
   }
-  
+    
   abstract class DeliteOpReduceLike[A:Manifest] extends DeliteOpLoop[A] {
     type OpType <: DeliteOpReduceLike[A]
     final lazy protected val rV: (Sym[A],Sym[A]) = copyOrElse(_.rV)((reflectMutableSym(fresh[A]), fresh[A])) // TODO: transform vars??
@@ -324,6 +417,7 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
       stripFirst = !isPrimitiveType(manifest[A]) && !this.mutable
     ))
   }
+  
   
   /**
    * Parallel map-reduction from a DeliteCollection[A] => R. The map-reduce is composed, so no temporary collection
@@ -376,7 +470,7 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
       rFunc = reifyEffects(reduce(rV._1, rV._2)),
       stripFirst = !isPrimitiveType(manifest[R]) && !this.mutable
     ))
-  }
+  }  
 
   // for sumIf ...
 /*
@@ -482,7 +576,7 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
       stripFirst = !isPrimitiveType(manifest[R]) && !this.mutable
     ))
   }
-
+  
   // reduce tuple in parallel, return first component
   abstract class DeliteOpZipWithReduceTuple[A:Manifest,B:Manifest,R:Manifest,Q:Manifest]
     extends DeliteOpLoop[R] {
@@ -507,9 +601,7 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
       rFuncSeq = /*reifyEffects*/(reduce(rV._1, rV._2)),  //FIXME: tupled reify
       stripFirst = (!isPrimitiveType(manifest[R]) || !isPrimitiveType(manifest[R])) && !this.mutable
     ))
-  }
-
-
+  }  
 
   /**
    * Parallel foreach from DeliteCollection[A] => Unit. Input functions must specify any free variables that it
@@ -534,7 +626,7 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
       sync = reifyEffects(this.sync(i))
     ))
   }
-  
+
   abstract class DeliteOpIndexedLoop extends DeliteOpLoop[Unit] {
     type OpType <: DeliteOpIndexedLoop
     val size: Exp[Int]
@@ -545,7 +637,7 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
       sync = unit(List())
     ))
   }
-  
+    
   /**
    * Deprecated Delite ops  
    */
@@ -637,17 +729,38 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
 
   // alternative: leave reflectPure as above and override toAtom...
 
-  def reflectPure[A:Manifest](d: Def[A]): Exp[A] = d match {
+  def reflectPure[A:Manifest](d: Def[A]): Exp[A] = d match {  // TODO: should take a SourceContext, too
     case x: DeliteOpLoop[_] =>
       val mutableInputs = readMutableData(d) //TODO: necessary or not??
       //val mutableInputs = Nil // readMutableData(d) TODO: necessary or not??
       val re = Read(mutableInputs)
       val be = summarizeBody(x.body)
       reflectEffect(d, re andAlso be)
+    case x: DeliteOpSingleTask[_] =>      
+      val mutableInputs = readMutableData(d) //TODO: necessary or not??
+      //val mutableInputs = Nil // readMutableData(d) TODO: necessary or not??
+      val re = Read(mutableInputs)
+      val be = summarizeEffects(x.block)
+      reflectEffect(d, re andAlso be)
     case _ => 
-      toAtom(d) // TODO: just to make refactoring easier in case we want to change to reflectSomething
+      toAtom(d)
   }
 
+  // TBD: move logic from reflectPure (above) into reflectEffect?
+
+  // HACK lazy val bites again: must make sure that block is evaluated!
+  override def reflectEffect[A:Manifest](d: Def[A], u: Summary)(implicit ctx: SourceContext): Exp[A] = d match {
+    case x: DeliteOpSingleTask[_] =>
+      x.block
+      super.reflectEffect(d,u)
+    case x: DeliteOpLoop[_] =>
+      x.body
+      super.reflectEffect(d,u)
+    case _ =>
+      super.reflectEffect(d,u)
+  }
+
+  // what about this: enable?
   // override def reflectMutable[A:Manifest](d: Def[A]): Exp[A] = d match {
   //   case x: DeliteOpLoop[_] => 
   //     val mutableInputs = readMutableData(d)    
@@ -672,9 +785,12 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
     d match {
       case e: DeliteCollectElem[a,ca] => 
         DeliteCollectElem[a,ca]( // need to be a case class for equality (do we rely on equality?)
+          aV = f(e.aV).asInstanceOf[Sym[DeliteArray[a]]],
           alloc = f(e.alloc),
+          allocDataStructure = f(e.allocDataStructure),
           func = f(e.func),
-          cond = f(e.cond)
+          cond = f(e.cond),
+          emitterFactory = e.emitterFactory
         ).asInstanceOf[Def[A]]
       case e: DeliteForeachElem[a] => 
         DeliteForeachElem[a](
@@ -715,7 +831,8 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
     case s: DeliteOpSingleTask[_] if s.requireInputs => syms(s.block) ++ super.syms(e) // super call: add case class syms (iff flag is set)
     case s: DeliteOpSingleTask[_] => syms(s.block)
     case e: DeliteOpExternal[_] => syms(e.allocVal) ++ super.syms(e)
-    case op: DeliteCollectElem[_,_] => syms(op.func) ++ syms(op.cond) ++ syms(op.alloc)
+    case op: DeliteCollectElem[_,_] => syms(op.func) ++ syms(op.cond) ++ syms(op.alloc) ++ syms(op.allocDataStructure)
+    case op: DeliteHashElem[_,_,_,_] => syms(op.func) ++ syms(op.cond) ++ syms(op.alloc)
 //    case op: DeliteForeachElem[_] => syms(op.func) ++ syms(op.cond) ++ syms(op.sync)
     case op: DeliteForeachElem[_] => syms(op.func) ++ syms(op.sync)
     case op: DeliteReduceElem[_] => syms(op.func) ++ syms(op.cond) ++ syms(op.zero) ++ syms(op.rFunc)
@@ -729,7 +846,8 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
     case s: DeliteOpSingleTask[_] if s.requireInputs => syms(s.block) ++ super.syms(e) // super call: add case class syms (iff flag is set)
     case s: DeliteOpSingleTask[_] => syms(s.block)
     case e: DeliteOpExternal[_] => syms(e.allocVal) ++ super.syms(e)
-    case op: DeliteCollectElem[_,_] => syms(op.func) ++ syms(op.cond) ++ syms(op.alloc)
+    case op: DeliteCollectElem[_,_] => syms(op.func) ++ syms(op.cond) ++ syms(op.alloc) ++ syms(op.allocDataStructure)
+    case op: DeliteHashElem[_,_,_,_] => syms(op.func) ++ syms(op.cond) ++ syms(op.alloc)
 //    case op: DeliteForeachElem[_] => syms(op.func) ++ syms(op.cond) ++ syms(op.sync)
     case op: DeliteForeachElem[_] => syms(op.func) ++ syms(op.sync)
     case op: DeliteReduceElem[_] => syms(op.func) ++ syms(op.cond) ++ syms(op.zero) ++ syms(op.rFunc)
@@ -742,7 +860,8 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
   override def boundSyms(e: Any): List[Sym[Any]] = e match {
     case s: DeliteOpSingleTask[_] => effectSyms(s.block)
     case e: DeliteOpExternal[_] => effectSyms(e.allocVal) /*++ super.effectSyms(e) */
-    case op: DeliteCollectElem[_,_] => effectSyms(op.func) ++ effectSyms(op.cond) ++ effectSyms(op.alloc)
+    case op: DeliteHashElem[_,_,_,_] => effectSyms(op.func) ++ effectSyms(op.cond) ++ effectSyms(op.alloc)
+    case op: DeliteCollectElem[_,_] => effectSyms(op.func) ++ effectSyms(op.cond) ++ syms(op.aV) ++ effectSyms(op.alloc) ++ effectSyms(op.allocDataStructure)
 //    case op: DeliteForeachElem[_] => effectSyms(op.func) ++ effectSyms(op.cond) ++ effectSyms(op.sync)
     case op: DeliteForeachElem[_] => effectSyms(op.func) ++ effectSyms(op.sync)
     case op: DeliteReduceElem[_] => List(op.rV._1, op.rV._2) ++ effectSyms(op.func) ++ effectSyms(op.cond) ++ effectSyms(op.zero) ++ effectSyms(op.rFunc)
@@ -757,7 +876,8 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
     case s: DeliteOpSingleTask[_] if s.requireInputs => freqNormal(s.block) ++ super.symsFreq(e) // super call: add case class syms (iff flag is set)
     case s: DeliteOpSingleTask[_] => freqNormal(s.block)
     case e: DeliteOpExternal[_] => freqNormal(e.allocVal) ++ super.symsFreq(e)
-    case op: DeliteCollectElem[_,_] => freqNormal(op.alloc) ++ freqHot(op.cond) ++ freqHot(op.func)
+    case op: DeliteCollectElem[_,_] => freqNormal(op.alloc) ++ freqHot(op.cond) ++ freqHot(op.func) ++ freqNormal(op.allocDataStructure)
+    case op: DeliteHashElem[_,_,_,_] => freqNormal(op.alloc) ++ freqHot(op.cond) ++ freqHot(op.func)
 //    case op: DeliteForeachElem[_] => freqNormal(op.sync) ++ freqHot(op.cond) ++ freqHot(op.func)
     case op: DeliteForeachElem[_] => freqNormal(op.sync) ++ freqHot(op.func)
     case op: DeliteReduceElem[_] => freqHot(op.cond) ++ freqHot(op.func) ++ freqNormal(op.zero) ++ freqHot(op.rFunc)
@@ -774,6 +894,7 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
     case s: DeliteOpSingleTask[_] => syms(s.block)
     case e: DeliteOpExternal[_] => Nil
     case op: DeliteCollectElem[_,_] => Nil // in particular not op.alloc !
+    case op: DeliteHashElem[_,_,_,_] => Nil // in particular not op.alloc !
     case op: DeliteForeachElem[_] => Nil
     case op: DeliteReduceElem[_] => Nil
     case op: DeliteReduceTupleElem[_,_] => Nil
@@ -786,6 +907,7 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
     case s: DeliteOpSingleTask[_] => Nil
     case e: DeliteOpExternal[_] => Nil
     case op: DeliteCollectElem[_,_] => syms(op.func)
+    case op: DeliteHashElem[_,_,_,_] => syms(op.func)
     case op: DeliteForeachElem[_] => Nil
     case op: DeliteReduceElem[_] => Nil
     case op: DeliteReduceTupleElem[_,_] => Nil
@@ -798,6 +920,7 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
     case s: DeliteOpSingleTask[_] => Nil
     case e: DeliteOpExternal[_] => Nil
     case op: DeliteCollectElem[_,_] => Nil
+    case op: DeliteHashElem[_,_,_,_] => Nil
     case op: DeliteForeachElem[_] => Nil
     case op: DeliteReduceElem[_] => Nil
     case op: DeliteReduceTupleElem[_,_] => Nil
@@ -809,7 +932,8 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
   override def copySyms(e: Any): List[Sym[Any]] = e match {
     case s: DeliteOpSingleTask[_] => Nil
     case e: DeliteOpExternal[_] => syms(e.allocVal)
-    case op: DeliteCollectElem[_,_] => syms(op.alloc)
+    case op: DeliteCollectElem[_,_] => syms(op.alloc) ++ syms(op.allocDataStructure)
+    case op: DeliteHashElem[_,_,_,_] => syms(op.alloc)
     case op: DeliteForeachElem[_] => Nil
     case op: DeliteReduceElem[_] => Nil
     case op: DeliteReduceTupleElem[_,_] => Nil
@@ -821,7 +945,7 @@ trait DeliteOpsExp extends BaseFatExp with EffectExp with VariablesExp with Loop
 
 
 
-trait BaseGenDeliteOps extends BaseGenLoopsFat with LoopFusionOpt {
+trait BaseGenDeliteOps extends BaseGenLoopsFat with LoopFusionOpt with BaseGenStaticData {
   val IR: DeliteOpsExp
   import IR._
 
@@ -880,7 +1004,22 @@ trait BaseGenDeliteOps extends BaseGenLoopsFat with LoopFusionOpt {
 
 }
 
-trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
+
+
+trait ScalaGenStaticDataDelite extends ScalaGenStaticData {
+  val IR: StaticDataExp
+  import IR._
+  
+  override def emitNode(sym: Sym[Any], rhs: Def[Any])(implicit stream: PrintWriter) = rhs match {
+    case StaticData(x) => 
+      // TODO: should call super if we're generating a single big scala file
+      emitValDef(sym, "ppl.delite.runtime.graph.ops.Arguments.staticData["+remap(sym.Type)+"](\""+quote(sym)+"\") // static data: " + x)
+    case _ => super.emitNode(sym, rhs)
+  }
+}
+
+
+trait ScalaGenDeliteOps extends ScalaGenLoopsFat with ScalaGenStaticDataDelite with BaseGenDeliteOps { // not sure where to mix in ScalaGenStaticData
   import IR._
 
   def quotearg(x: Sym[Any]) = quote(x) + ": " + quotetp(x)
@@ -899,12 +1038,35 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
    * MultiLoop components
    */
   def emitCollectElem(op: AbstractFatLoop, sym: Sym[Any], elem: DeliteCollectElem[_,_], prefixSym: String = "")(implicit stream: PrintWriter) {
-    if (elem.cond.nonEmpty) {
-      stream.print("if (" + elem.cond.map(c=>quote(getBlockResult(c))).mkString(" && ") + ") ")
+    val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+    if (elem.needsSpecialCollect) {    
+      if (elem.cond.nonEmpty)
+        stream.print("if (" + elem.cond.map(c=>quote(getBlockResult(c))).mkString(" && ") + ") ")
+      emitter.emitAddToBuffer(elemType(elem), prefixSym, quote(sym), quote(getBlockResult(elem.func)))
+    } else {
+      def arrayUpdate(field: String) {
+        val dot = if (field == "") "" else "."
+        stream.println(prefixSym + quote(sym) + "_data" + field + "(" + quote(op.v) + ") = " + quote(getBlockResult(elem.func)) + dot + field)
+      }
+      structType(elemType(elem)) match {
+        case Some(elems) => elems.foreach(f => arrayUpdate(f._1))
+        case None => arrayUpdate("")
+      }
+    }
+  }
+
+  
+  /**
+   * MultiLoop components
+   */
+  def emitHashElem(op: AbstractFatLoop, sym: Sym[Any], elem: DeliteHashElem[_,_,_,_], prefixSym: String = "")(implicit stream: PrintWriter) {
+    val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+    if (elem.needsSpecialCollect) {
+      if (elem.cond.nonEmpty) stream.print("if (" + elem.cond.map(c=>quote(getBlockResult(c))).mkString(" && ") + ") ")
       if (deliteKernel)
-        stream.println(prefixSym + quote(sym) + "_buf_append(" + quote(getBlockResult(elem.func)) + ")")
+        emitter.emitAddToBuffer(elemType(elem), prefixSym, quote(sym), quote(getBlockResult(elem.func)))
       else
-        stream.println(prefixSym + quote(sym) + ".insert(" + prefixSym + quote(sym) + ".length, " + quote(getBlockResult(elem.func)) + ")")
+        emitter.emitAddToDataStructure(prefixSym, quote(sym), quote(getBlockResult(elem.func)))
     } else
       stream.println(prefixSym + quote(sym) + ".dcUpdate(" + quote(op.v) + ", " + quote(getBlockResult(elem.func)) + ")")
   }
@@ -936,7 +1098,7 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
   }
 
   def emitReduceElem(op: AbstractFatLoop, sym: Sym[Any], elem: DeliteReduceElem[_], prefixSym: String = "")(implicit stream: PrintWriter) {
-    if (elem.cond.nonEmpty){
+    if (elem.cond.nonEmpty) {
       stream.println("if (" + elem.cond.map(c=>quote(getBlockResult(c))).mkString(" && ") + ") {"/*}*/)
       if (elem.stripFirst)
         emitInitializeOrReduction(op, sym, elem, prefixSym)
@@ -996,6 +1158,7 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
 
   def emitMultiLoopFuncs(op: AbstractFatLoop, symList: List[Sym[Any]])(implicit stream: PrintWriter) {
     val elemFuncs = op.body flatMap { // don't emit dependencies twice!
+      case elem: DeliteHashElem[_, _, _, _] => elem.func :: elem.cond
       case elem: DeliteCollectElem[_,_] => elem.func :: elem.cond
 //      case elem: DeliteForeachElem[_] => elem.cond // only emit func inside condition! TODO: how to avoid emitting deps twice? // elem.func :: elem.cond
       case elem: DeliteForeachElem[_] => List(elem.func) 
@@ -1008,13 +1171,50 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
   def emitInlineAbstractFatLoop(op: AbstractFatLoop, symList: List[Sym[Any]])(implicit stream: PrintWriter) {
     // initialization             
     (symList zip op.body) foreach {
-      case (sym, elem: DeliteCollectElem[_,_]) =>
+      case (sym, elem: DeliteHashElem[_, _, _, _]) =>
         stream.println("val " + quote(sym) + " = {"/*}*/)
         emitBlock(elem.alloc) // FIXME: how do we know it is the right size? conditions could have been added retrospectively!!
         if (elem.cond.nonEmpty)
           stream.println("//TODO: buffer size might be wrong (loop has conditions)")
         stream.println(quote(getBlockResult(elem.alloc)))
         stream.println(/*{*/"}")              
+      case (sym, elem: DeliteCollectElem[_,_]) =>
+        if (elem.cond.nonEmpty) {
+          structType(elemType(elem)) match {
+            case Some(elems) => buf_block(elems)
+            case None => buf_block(Map(""->getBlockResult(elem.func).Type.asInstanceOf[Manifest[Any]]))
+          }
+          def buf_block(elems: Map[String,Manifest[Any]]) {
+            elems.foreach {e => stream.println("var " + quote(sym) + "_buf" + e._1 + ": Array[" + remap(e._2) + "] = new Array(128)") }
+            stream.println("var " + quote(sym) + "_size = 0")
+            stream.println("def " + quote(sym) + "_buf_append(" + elems.map(e => "x" + e._1 + ": " + remap(e._2)).mkString(",") + "): Unit = {"/*}*/)
+            stream.println("if (" + quote(sym) + "_size >= " + quote(sym) + "_buf" + elems.head._1 + ".length) {"/*}*/)
+            elems.foreach { e => stream.println("val old" + e._1 + " = " + quote(sym) + "_buf" + e._1)
+              stream.println(quote(sym) + "_buf" + e._1 + " = new Array(2*old" + e._1 + ".length)")
+              stream.println("System.arraycopy(old" + e._1 + ", 0, " + quote(sym) + "_buf" + e._1 + ", 0, old" + e._1 + ".length)")
+            }
+            stream.println(/*{*/"}")
+            elems.foreach { e => stream.println(quote(sym) + "_buf" + e._1 + "(" + quote(sym) + "_size) = x" + e._1) }
+            stream.println(quote(sym) + "_size += 1")
+            stream.println(/*{*/"}")
+          }
+        } else {
+          structType(elemType(elem)) match {
+            case Some(elems) => data_block(elems)
+            case None => data_block(Map(""->getBlockResult(elem.func).Type.asInstanceOf[Manifest[Any]]))
+          }
+          def data_block(elems: Map[String, Manifest[Any]]) = elems.foreach { e =>
+            stream.println("val " + quote(sym) + "_data" + e._1 + ": Array[" + remap(e._2) + "] = new Array(" + quote(op.size) + ")")
+          }
+        }
+/*
+        stream.println("val " + quote(sym) + " = {"/*}*/)
+        emitBlock(elem.alloc) // FIXME: how do we know it is the right size? conditions could have been added retrospectively!!
+        if (elem.cond.nonEmpty)
+          stream.println("//TODO: buffer size might be wrong (loop has conditions)")
+        stream.println(quote(getBlockResult(elem.alloc)))
+        stream.println(/*{*/"}")
+*/
       case (sym, elem: DeliteForeachElem[_]) => 
         stream.println("var " + quotearg(sym) + " = ()") // must be type Unit
       case (sym, elem: DeliteReduceElem[_]) =>
@@ -1065,6 +1265,8 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
     // body
     emitMultiLoopFuncs(op, symList)
     (symList zip op.body) foreach {
+      case (sym, elem: DeliteHashElem[_, _, _, _]) =>
+        emitHashElem(op, sym, elem)
       case (sym, elem: DeliteCollectElem[_,_]) =>
         emitCollectElem(op, sym, elem)
       case (sym, elem: DeliteForeachElem[_]) => 
@@ -1078,39 +1280,185 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
     }
     stream.println(quote(op.v) + " += 1")
     stream.println(/*{*/"} // end fat loop " + symList.map(quote).mkString(","))
+    // finalize
+    (symList zip op.body) foreach {
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+        elem.emitterFactory.map(_.scala).get.emitDataDeclaration(elemType(elem), quote(sym), "", quote(sym) + "_data")
+        stream.println("val " + quote(sym) + " = {")
+        emitBlock(elem.alloc)
+        elem.emitterFactory.get.scala.emitInitializeDataStructure(quote(sym), "", quote(getBlockResult(elem.alloc)), quote(sym) + "_data")
+        stream.println("}")
+      case (sym, elem: DeliteCollectElem[_,_]) =>
+        structType(elemType(elem)) match {
+          case Some(elems) => final_block(elems)
+          case None => final_block(Map(""->getBlockResult(elem.func).Type.asInstanceOf[Manifest[Any]]))
+        }
+        def final_block(elems: Map[String, Manifest[Any]]) {
+          if (elem.cond.nonEmpty) {
+            elems.foreach { e =>
+              stream.println("val " + quote(sym) + "_data" + e._1 + ": Array[" + remap(e._2) + "] = new Array(" + quote(sym) + "_size)")
+              stream.println("System.arraycopy(" + quote(sym) + "_buf" + e._1 + ", 0, " + quote(sym) + "_data" + e._1 + ", 0, " + quote(sym) + "_size)")
+              stream.println(quote(sym) + "_buf" + e._1 + " = null")
+            }
+          }
+          if (elem.emitterFactory.isEmpty) {
+            if (elems.head._1 == "")
+              emitValDef(elem.aV, quote(sym) + "_data")
+            else
+              emitValDef(elem.aV, " = new " + remap(elem.aV.Type) + elems.map(e => quote(sym) + "_data" + e._1).mkString("(",",",")"))
+          } else {
+            elem.emitterFactory.map(_.scala).getOrElse(standardScalaEmitter).emitDataDeclaration(elemType(elem), quote(sym), "", quote(sym) + "_data")
+          }
+          stream.println("val " + quote(sym) + " = {"/*}*/)
+          emitBlock(elem.alloc)
+          stream.println(quote(getBlockResult(elem.alloc)))
+          stream.println(/*{*/"}")
+        }
+      case (sym, elem: DeliteForeachElem[_]) => 
+      case (sym, elem: DeliteReduceElem[_]) =>
+      case (sym, elem: DeliteReduceTupleElem[_,_]) =>
+    }
   }
-
+  
+  implicit def standardScalaEmitter = new ScalaEmitter {
+    def emitBufferDefs(elemType: Manifest[_], kernelname: String, basename: String, elemtype: String)(implicit stream: PrintWriter) {
+      structType(elemType) match {
+          case Some(elems) => buf_block(elems.map(e => (e._1, remap(e._2))))
+          case None => buf_block(Map("" -> elemtype))
+        }
+        def buf_block(elems: Map[String,String]) {
+          elems.foreach {e => stream.println("var " + basename + "_buf" + e._1 + ": Array[" + e._2 + "] = _") }
+          stream.println("var " + basename + "_size = 0")
+          stream.println("var " + basename + "_offset = 0")
+          stream.println("var " + basename + "_chunkIdx: Int = _")
+          stream.println("var " + basename + "_numChunks: Int = _")
+          stream.println("var " + basename + "_activations: Array[activation_" + kernelname + "] = _")
+          stream.println("def " + basename + "_buf_init(chunkIdx: Int, numChunks: Int): Unit = {"/*}*/)
+          stream.println(basename + "_chunkIdx = chunkIdx")
+          stream.println(basename + "_numChunks = numChunks")
+          elems.foreach { e => stream.println(basename + "_buf" + e._1 + " = new Array(128)") }
+          stream.println(/*{*/"}")
+          stream.println("def " + basename + "_buf_append(" + elems.map(e => "x" + e._1 + ": " + e._2).mkString(",") + "): Unit = {"/*}*/)
+          stream.println("if (" + basename + "_size >= " + basename + "_buf" + elems.head._1 + ".length) {"/*}*/)
+          elems.foreach { e => stream.println("val old" + e._1 + " = " + basename + "_buf" + e._1)
+          stream.println(basename + "_buf" + e._1 + " = new Array(2*old" + e._1 + ".length)")
+          stream.println("System.arraycopy(old" + e._1 + ", 0, " + basename + "_buf" + e._1 + ", 0, old" + e._1 + ".length)")
+          }
+          stream.println(/*{*/"}")
+          elems.foreach { e => stream.println(basename + "_buf" + e._1 + "(" + basename + "_size) = x" + e._1) }
+          stream.println(basename + "_size += 1")
+          stream.println(/*{*/"}")
+        }
+        /*stream.println("def " + basename + "_buf_appendAll(xs: Array[" + elemtype + "], len: Int): Unit = {"/*}*/)
+        stream.println("if (" + basename + "_size + len >= " + basename + "_buf.length) {"/*}*/)
+        stream.println("val old = " + basename + "_buf")
+        stream.println(basename + "_buf = new Array(2*(old.length+len))")
+        stream.println("System.arraycopy(old, 0, " + basename + "_buf, 0, old.length)")
+        stream.println(/*{*/"}")
+        stream.println("System.arraycopy(xs, 0, " + basename + "_buf, " + basename + "_size, len)")
+        stream.println(basename + "_size += len")
+        stream.println(/*{*/"}") */
+    }
+    def emitInitSubActivation(basename: String, activname: String, chunkIdxVar: String, numChunksVar: String)(implicit stream: PrintWriter) {
+      stream.println(activname + "." + basename + "_buf_init(" + chunkIdxVar + ", " + numChunksVar + ")")
+    }
+    def emitAddToBuffer(elemType: Manifest[_], prefixSym: String, basename: String, elemname: String)(implicit stream: PrintWriter) {
+      structType(elemType) match {
+        case Some(elems) => bufferAppend(elems.keys.toSeq)
+        case None => bufferAppend(List(""))
+      }
+      def bufferAppend(fields: Seq[String]) {
+        val dot = if (fields(0) == "") "" else "."
+        stream.println(prefixSym + basename + "_buf_append(" + fields.map(f => elemname + dot + f).mkString(",") + ")")
+      }
+    }
+    def emitAddToDataStructure(prefixSym: String, basename: String, elemname: String)(implicit stream: PrintWriter) {
+      stream.println(prefixSym + basename + ".insert(" + prefixSym + basename + ".length, " + elemname + ")")
+    }
+    def emitPostCombine(basename: String, activname: String, lhsname: String)(implicit stream: PrintWriter) {
+      stream.println(activname + "." + basename + "_offset = " + lhsname + "." + basename + "_offset + " + lhsname + "." + basename + "_size")
+      
+      // init first block
+      stream.println("if (%s.%s_chunkIdx == 0) {".format(lhsname, basename))
+      stream.println("%s.%s_activations = new Array(%s.%s_numChunks)".format(lhsname, basename, lhsname, basename))
+      stream.println("%s.%s_activations(0) = %s".format(lhsname, basename, lhsname))
+      stream.println("}")
+      
+      // copy and update the array
+      stream.println("%s.%s_activations = %s.%s_activations".format(activname, basename, lhsname, basename))
+      stream.println("%s.%s_activations(%s.%s_chunkIdx) = %s".format(activname, basename, activname, basename, activname))
+    }
+    def emitPostProcInit(elemType: Manifest[_], basename: String, activname: String)(implicit stream: PrintWriter) {
+      //stream.println("if (" + activname + "." + basename + "_offset > 0) {"/*}*/) // set data array for result object
+      stream.println("val len = " + activname + "." + basename + "_offset + " + activname + "." + basename + "_size")
+      //stream.println("" + activname + "." + basename + ".unsafeSetData(new Array(len), len)")
+      structType(elemType) match {
+        case Some(elems) => postProc_block(elems.keys)
+        case None => postProc_block(List(""))
+      }
+      def postProc_block(elems: Iterable[String]) = elems.foreach(e => stream.println(activname + "." + basename + "_data" + e + " = new Array(len)"))
+      //stream.println(/*{*/"} else {"/*}*/)
+      //stream.println("" + activname + "." + basename + ".unsafeSetData(" + activname + "." +basename + "_buf, " + activname + "." + basename + "_size)")
+      //stream.println(activname + "." + basename + "_data = " + activname + "." + basename + "_buf")
+      //stream.println(/*{*/"}")
+    }
+    def emitPostProcess(elemType: Manifest[_], basename: String, activname: String)(implicit stream: PrintWriter) {
+      structType(elemType) match {
+        case Some(elems) => postProcess_block(elems.keys)
+        case None => { //TODO: use activations with struct types?
+          stream.println("if (%s.%s_numChunks > 1) {".format(activname, basename))
+          stream.println("%s.%s_data = %s.%s_activations(%s.%s_numChunks - 1).%s_data".format(activname, basename, activname, basename, activname, basename, basename))
+          stream.println("}")
+          postProcess_block(List(""))
+        }
+      }
+      //stream.println("if (" + activname + "." + basename + "_data ne " + activname + "." + basename + "_buf)")
+      def postProcess_block(elems: Iterable[String]) = elems.foreach { e =>
+        stream.println("System.arraycopy(" + activname + "." + basename + "_buf" + e + ", 0, " + activname + "." + basename + "_data" + e + ", " + activname + "." + basename + "_offset, " + activname + "." + basename + "_size)")
+        stream.println("" + activname + "." + basename + "_buf" + e + " = null")
+      }
+    }
+    def emitPostCombine2(basename: String, activname: String, lhsname: String)(implicit stream: PrintWriter) {
+    }
+    def emitPostProcInit2(basename: String, activname: String)(implicit stream: PrintWriter) {
+    }
+    def emitPostProcess2(basename: String, activname: String)(implicit stream: PrintWriter) {
+    }
+    def emitDataDeclaration(elemType: Manifest[_], basename: String, prefix: String, dataname: String, dataType: String = "")(implicit stream: PrintWriter) {
+      structType(elemType) match {
+         case Some(elems) =>
+           stream.println("val " + dataname + " = new " + dataType + elems.map(e => prefix + basename + "_data" + e._1).mkString("(",",",")"))
+         case None =>
+           stream.println("val " + dataname + " = " + prefix + basename + "_data")
+       }
+    }
+    def emitInitializeDataStructure(basename: String, prefix: String, collectionname: String, dataname: String)(implicit stream: PrintWriter) {
+      // emitted directly
+    }
+  }
+  
   def emitAbstractFatLoopKernelExtra(op: AbstractFatLoop, symList: List[Sym[Any]])(implicit stream: PrintWriter): Unit = {
     val kernelName = symList.map(quote).mkString("")
     stream.println("final class activation_" + kernelName + " {"/*}*/)
     (symList zip op.body) foreach {
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+        stream.println("var " + quote(sym) + ": " + remap(sym.Type) + " = _")
+        if (elem.needsSpecialExtra) {
+          val emitter = elem.emitterScala.get
+          emitter.emitBufferDefs(elemType(elem), kernelName, quote(sym), remap(getBlockResult(elem.func).Type))
+        }
       case (sym, elem: DeliteCollectElem[_,_]) => 
         stream.println("var " + quote(sym) + ": " + remap(sym.Type) + " = _")
-        if (elem.cond.nonEmpty) {
-          stream.println("var " + quote(sym) + "_buf: Array[" + remap(getBlockResult(elem.func).Type) + "] = _")
-          stream.println("var " + quote(sym) + "_size = 0")
-          stream.println("var " + quote(sym) + "_offset = 0")
-          stream.println("def " + quote(sym) + "_buf_init: Unit = {"/*}*/)
-          stream.println(quote(sym) + "_buf = new Array(128)")
-          stream.println(/*{*/"}")
-          stream.println("def " + quote(sym) + "_buf_append(x: " + remap(getBlockResult(elem.func).Type) + "): Unit = {"/*}*/)
-          stream.println("if (" + quote(sym) + "_size >= " + quote(sym) + "_buf.length) {"/*}*/)
-          stream.println("val old = " + quote(sym) + "_buf")
-          stream.println(quote(sym) + "_buf = new Array(2*old.length)")
-          stream.println("System.arraycopy(old, 0, " + quote(sym) + "_buf, 0, old.length)")
-          stream.println(/*{*/"}")
-          stream.println(quote(sym) + "_buf(" + quote(sym) + "_size) = x")
-          stream.println(quote(sym) + "_size += 1")
-          stream.println(/*{*/"}")
-          stream.println("def " + quote(sym) + "_buf_appendAll(xs: Array[" + remap(getBlockResult(elem.func).Type) + "], len: Int): Unit = {"/*}*/)
-          stream.println("if (" + quote(sym) + "_size + len >= " + quote(sym) + "_buf.length) {"/*}*/)
-          stream.println("val old = " + quote(sym) + "_buf")
-          stream.println(quote(sym) + "_buf = new Array(2*(old.length+len))")
-          stream.println("System.arraycopy(old, 0, " + quote(sym) + "_buf, 0, old.length)")
-          stream.println(/*{*/"}")
-          stream.println("System.arraycopy(xs, 0, " + quote(sym) + "_buf, " + quote(sym) + "_size, len)")
-          stream.println(quote(sym) + "_size += len")
-          stream.println(/*{*/"}")
+        if (elem.needsSpecialExtra) {
+          val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+          emitter.emitBufferDefs(elemType(elem), kernelName, quote(sym), remap(getBlockResult(elem.func).Type))
+        }
+        structType(elemType(elem)) match {
+          case Some(elems) => data_block(elems)
+          case None => data_block(Map(""->getBlockResult(elem.func).Type.asInstanceOf[Manifest[Any]]))
+        }
+        def data_block(elems: Map[String,Manifest[Any]]) = elems.foreach { e =>
+          stream.println("var " + quote(sym) + "_data" + e._1 + ": Array[" + remap(e._2) + "] = _")
         }
       case (sym, elem: DeliteForeachElem[_]) =>
         stream.println("var " + quote(sym) + ": " + remap(sym.Type) + " = _")
@@ -1142,12 +1490,30 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
     stream.println("def alloc: " + actType + " = {"/*}*/)
     stream.println("val __act = new " + actType)
     (symList zip op.body) foreach {
-      case (sym, elem: DeliteCollectElem[_,_]) =>
+      case (sym, elem: DeliteHashElem[_, _, _, _]) =>
         emitBlock(elem.alloc) // FIXME: how do we know it is the right size? conditions could have been added retrospectively!!
         if (elem.cond.nonEmpty)
           stream.println("//TODO: buffer size might be wrong (loop has conditions)")
         stream.println("__act." + quote(sym) + " = " + quote(getBlockResult(elem.alloc))) //FIXME: do in post-process
-      case (sym, elem: DeliteForeachElem[_]) => 
+      case (sym, elem: DeliteCollectElem[_,_]) =>
+        //emitBlock(elem.alloc) // FIXME: how do we know it is the right size? conditions could have been added retrospectively!!
+        //if (elem.cond.nonEmpty)
+        //  stream.println("//TODO: buffer size might be wrong (loop has conditions)")
+        //stream.println("__act." + quote(sym) + " = " + quote(getBlockResult(elem.alloc))) //FIXME: do in post-process
+        if (elem.cond.nonEmpty)
+          stream.println("// __act." + quote(sym) + "_data stays null for now")
+        else {
+          structType(elemType(elem)) match {
+            case Some(elems) => {
+              for ((name,tp) <- elems) {
+                assert(structType(tp).isEmpty, "FIXME: nested structs in MultiLoop output array alloc")
+                stream.println("__act." + quote(sym) + "_data" + name + " = new Array[" + remap(tp) + "](" + quote(op.size) + ")")
+              }
+            }
+            case  None => stream.println("__act." + quote(sym) + "_data = new Array(" + quote(op.size) + ")")
+          }
+        }
+      case (sym, elem: DeliteForeachElem[_]) =>
         stream.println("__act." + quote(sym) + " = ()") // must be type Unit, initialized in init below
       case (sym, elem: DeliteReduceElem[_]) => 
         stream.println("__act." + quote(sym) + "_zero = {"/*}*/)
@@ -1170,10 +1536,10 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
     stream.println("__act")
     stream.println(/*{*/"}")
     // processRange
-    stream.println("def processRange(__act: " + actType + ", start: Int, end: Int): " + actType + " = {"/*}*/)
+    stream.println("def processRange(__act: " + actType + ", start: Int, end: Int, chunkIdx: Int, numChunks: Int): " + actType + " = {"/*}*/)
     stream.println("var idx = start")
-    stream.println("val __act2 = init(__act,idx)")
-    stream.println("idx += 1")
+    stream.println("val __act2 = init(__act,idx,chunkIdx,numChunks)")
+    //stream.println("idx += 1")
     stream.println("while (idx < end) {"/*}*/)
     stream.println("process(__act2, idx)")
     stream.println("idx += 1")
@@ -1193,26 +1559,42 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
     //out.append("val acc = head.closure.processRange(out,idx,end)\n")
 
 
-    stream.println("def init(__act: " + actType + ", " + quotearg(op.v) + "): " + actType + " = {"/*}*/)
-    if (op.body exists (loopBodyNeedsCombine _)) {
-      emitMultiLoopFuncs(op, symList)                               
+    stream.println("def init(__act: " + actType + ", " + quotearg(op.v) + ", chunkIdx: Int, numChunks: Int): " + actType + " = {"/*}*/)
+    if (op.body exists (d => loopBodyNeedsCombine(d) || loopBodyNeedsPostProcess(d))) {
+      //emitMultiLoopFuncs(op, symList)                               
       stream.println("val __act2 = new " + actType)
       (symList zip op.body) foreach {
-        case (sym, elem: DeliteCollectElem[_,_]) =>
-          if (elem.cond.nonEmpty) {
-            stream.println("__act2." + quote(sym) + "_buf_init")
+        case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+          val emitter = elem.emitterScala.get
+          if (elem.needsSpecialInit) {
+            emitter.emitInitSubActivation(quote(sym), "__act2", "chunkIdx", "numChunks")
           }
           stream.println("__act2." + quote(sym) + " = " + "__act." + quote(sym))
+          //emitCollectElem(op, sym, elem, "__act2.")
+        case (sym, elem: DeliteCollectElem[_,_]) =>
+          val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+          if (elem.needsSpecialInit) {
+            emitter.emitInitSubActivation(quote(sym), "__act2", "chunkIdx", "numChunks")
+          }
+          stream.println("__act2." + quote(sym) + " = " + "__act." + quote(sym))
+          //emitCollectElem(op, sym, elem, "__act2.")
+          /* TODO ? 
+          if (elem.cond.nonEmpty) {
+            stream.println("__act2." + quote(sym) + "_buf_init")
+          } else {
+            stream.println("__act2." + quote(sym) + "_data = " + "__act." + quote(sym) + "_data")
+          }
           emitCollectElem(op, sym, elem, "__act2.")
+          */
         case (sym, elem: DeliteForeachElem[_]) => 
           stream.println("__act2." + quote(sym) + " = {"/*}*/)
-          emitForeachElem(op, sym, elem)
+          //emitForeachElem(op, sym, elem)
           stream.println(/*{*/"}")               
         case (sym, elem: DeliteReduceElem[_]) =>
           if (elem.stripFirst) {
             stream.println("__act2." + quote(sym) + "_zero = " + "__act." + quote(sym) + "_zero") // do we need zero here? yes, for comparing against...
             stream.println("__act2." + quote(sym) + " = {"/*}*/)
-            emitFirstReduceElem(op, sym, elem, "__act2.")
+            //emitFirstReduceElem(op, sym, elem, "__act2.")
             stream.println(/*{*/"}")
           } else { 
             stream.println("__act2." + quote(sym) + "_zero = " + "__act." + quote(sym) + "_zero")
@@ -1221,7 +1603,7 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
             } else {
               stream.println("__act2." + quote(sym) + " = " + "__act2." + quote(sym) + "_zero.cloneL") // separate zero buffer
             }
-            emitReduceElem(op, sym, elem, "__act2.")
+            //emitReduceElem(op, sym, elem, "__act2.")
           }
         case (sym, elem: DeliteReduceTupleElem[_,_]) =>
           // no strip first here ... stream.println("assert(false, \"TODO: tuple reduce\")")
@@ -1229,17 +1611,19 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
           stream.println("__act2." + quote(sym) + "_zero_2 = " + "__act." + quote(sym) + "_zero_2")
           stream.println("__act2." + quote(sym) + "   = " + "__act2." + quote(sym) + "_zero  ")
           stream.println("__act2." + quote(sym) + "_2 = " + "__act2." + quote(sym) + "_zero_2")
-          emitReduceTupleElem(op, sym, elem, "__act2.")
+          //emitReduceTupleElem(op, sym, elem, "__act2.")
       }
       stream.println("__act2")
     } else {
-      stream.println("process(__act, " + quote(op.v) + ")")
+      //stream.println("process(__act, " + quote(op.v) + ")")
       stream.println("__act")
     }
     stream.println(/*{*/"}")
     stream.println("def process(__act: " + actType + ", " + quotearg(op.v) + "): Unit = {"/*}*/)
     emitMultiLoopFuncs(op, symList)
     (symList zip op.body) foreach {
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+        emitHashElem(op, sym, elem, "__act.")
       case (sym, elem: DeliteCollectElem[_,_]) =>
         emitCollectElem(op, sym, elem, "__act.")
       case (sym, elem: DeliteForeachElem[_]) =>
@@ -1254,6 +1638,7 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
     stream.println(/*{*/"}")
     stream.println("def combine(__act: " + actType + ", rhs: " + actType + "): Unit = {"/*}*/)
     (symList zip op.body) foreach {
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
       case (sym, elem: DeliteCollectElem[_,_]) =>
       case (sym, elem: DeliteForeachElem[_]) => // nothing needed
       case (sym, elem: DeliteReduceElem[_]) =>
@@ -1281,12 +1666,19 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
     }
     stream.println(/*{*/"}")
     // scan/postprocess follows
-    stream.println("def postCombine(__act: " + actType + ", rhs: " + actType + "): Unit = {"/*}*/)
+    stream.println("def postCombine(__act: " + actType + ", lhs: " + actType + "): Unit = {"/*}*/)
     (symList zip op.body) foreach {
-      case (sym, elem: DeliteCollectElem[_,_]) =>
-        if (elem.cond.nonEmpty) {
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+        val emitter = elem.emitterScala.get
+        if (elem.needsPostProcess) {
           //calculate start offset from rhs.offset + rhs.size. if last chunk
-          stream.println("__act." + quote(sym) + "_offset = rhs." + quote(sym) + "_offset + rhs." + quote(sym) + "_size")
+          emitter.emitPostCombine(quote(sym), "__act", "lhs")
+        }
+      case (sym, elem: DeliteCollectElem[_,_]) =>
+        val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+        if (elem.needsPostProcess) {
+          //calculate start offset from rhs.offset + rhs.size. if last chunk
+          emitter.emitPostCombine(quote(sym), "__act", "lhs")
         }
       case (sym, elem: DeliteForeachElem[_]) =>
       case (sym, elem: DeliteReduceElem[_]) =>
@@ -1295,15 +1687,37 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
     stream.println(/*{*/"}")
     stream.println("def postProcInit(__act: " + actType + "): Unit = {"/*}*/) // only called for last chunk!!
     (symList zip op.body) foreach {
-      case (sym, elem: DeliteCollectElem[_,_]) =>
-        if (elem.cond.nonEmpty) {
-          stream.println("if (__act." + quote(sym) + "_offset > 0) {"/*}*/) // set data array for result object
-          stream.println("val len = __act." + quote(sym) + "_offset + __act." + quote(sym) + "_size")
-          stream.println("__act." + quote(sym) + ".unsafeSetData(new Array(len), len)")
-          stream.println(/*{*/"} else {"/*}*/)
-          stream.println("__act." + quote(sym) + ".unsafeSetData(__act." +quote(sym) + "_buf, __act." + quote(sym) + "_size)")
-          stream.println(/*{*/"}")
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+        val emitter = elem.emitterScala.get
+        if (elem.needsPostProcess) {
+          emitter.emitPostProcInit(elemType(elem), quote(sym), "__act")
         }
+      case (sym, elem: DeliteCollectElem[_,_]) =>
+        val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+        if (elem.needsPostProcess) {
+          emitter.emitPostProcInit(elemType(elem), quote(sym), "__act")
+        }
+        /* TODO ?
+        if (elem.cond.nonEmpty) {
+          // aks: this optimization can result in writing a too-large output array as the result of the delite op.
+          // are we always guaranteed to have a logical size field in the output?
+          //stream.println("if (__act." + quote(sym) + "_offset > 0) {"/*}*/) // set data array for result object
+          stream.println("val len = __act." + quote(sym) + "_offset + __act." + quote(sym) + "_size")
+          structType(elemType(elem)) match {
+            case Some(elems) => {
+              for ((name,tp) <- elems) {
+                assert(structType(tp).isEmpty, "FIXME: nested structs in MultiLoop output array alloc")
+                stream.println("__act." + quote(sym) + "_data" + name + " = new Array[" + remap(tp) + "](len)")
+              }
+            }
+            case  None => stream.println("__act." + quote(sym) + "_data = new Array(len)")
+          }
+          //stream.println(/*{*/"} else {"/*}*/)
+          //stream.println("__act." + quote(sym) + "_data = __act." +quote(sym) + "_buf")
+          //stream.println(/*{*/"}")
+          
+        }
+        */
       case (sym, elem: DeliteForeachElem[_]) =>
       case (sym, elem: DeliteReduceElem[_]) =>
       case (sym, elem: DeliteReduceTupleElem[_,_]) =>
@@ -1311,20 +1725,121 @@ trait ScalaGenDeliteOps extends ScalaGenLoopsFat with BaseGenDeliteOps {
     stream.println(/*{*/"}")
     stream.println("def postProcess(__act: " + actType + "): Unit = {"/*}*/)
     (symList zip op.body) foreach {
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+        val emitter = elem.emitterScala.get
+        if (elem.needsPostProcess) {
+          emitter.emitPostProcess(elemType(elem), quote(sym), "__act")
+        }
       case (sym, elem: DeliteCollectElem[_,_]) =>
+        val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+        if (elem.needsPostProcess) {
+          //calculate start offset from rhs.offset + rhs.size
+          emitter.emitPostProcess(elemType(elem), quote(sym), "__act")
+        }
+      /* TODO ?
+      case (sym, elem: DeliteCollectElem[_,_]) => //FIXME: get rid of .data and adapt to new alloc style
         if (elem.cond.nonEmpty) {
           //calculate start offset from rhs.offset + rhs.size
-          stream.println("if (__act." + quote(sym) + ".data ne __act." + quote(sym) + "_buf)")
-          stream.println("System.arraycopy(__act." + quote(sym) + "_buf, 0, __act." + quote(sym) + ".data, __act." + quote(sym) + "_offset, __act." + quote(sym) + "_size)")
-          stream.println("__act." + quote(sym) + "_buf = null")
+          //stream.println("if (__act." + quote(sym) + "_data ne __act." + quote(sym) + "_buf)")
+          structType(elemType(elem)) match {
+            case Some(elems) => copyBlock(elems.keys)
+            case None => copyBlock(List(""))
+          }
+          def copyBlock(elems: Iterable[String]) = elems.foreach { e =>
+            stream.println("System.arraycopy(__act." + quote(sym) + "_buf" + e + ", 0, __act." + quote(sym) + "_data" + e + ", __act." + quote(sym) + "_offset, __act." + quote(sym) + "_size)")
+            stream.println("__act." + quote(sym) + "_buf" + e + " = null")
+          }
+        }
+      */
+      case (sym, elem: DeliteForeachElem[_]) =>
+      case (sym, elem: DeliteReduceElem[_]) =>
+      case (sym, elem: DeliteReduceTupleElem[_,_]) =>
+    }
+    stream.println(/*{*/"}")
+    
+    // scan/postprocess 2 follows
+    stream.println("def postCombine2(__act: " + actType + ", lhs: " + actType + "): Unit = {"/*}*/)
+    (symList zip op.body) foreach {
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+        val emitter = elem.emitterScala.get
+        if (elem.needsPostProcess2) {
+          //calculate start offset from rhs.offset + rhs.size. if last chunk
+          emitter.emitPostCombine2(quote(sym), "__act", "lhs")
+        }
+      case (sym, elem: DeliteCollectElem[_,_]) =>
+        val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+        if (elem.needsPostProcess2) {
+          //calculate start offset from rhs.offset + rhs.size. if last chunk
+          emitter.emitPostCombine2(quote(sym), "__act", "lhs")
         }
       case (sym, elem: DeliteForeachElem[_]) =>
       case (sym, elem: DeliteReduceElem[_]) =>
       case (sym, elem: DeliteReduceTupleElem[_,_]) =>
     }
     stream.println(/*{*/"}")
-
-
+    stream.println("def postProcInit2(__act: " + actType + "): Unit = {"/*}*/) // only called for last chunk!!
+    (symList zip op.body) foreach {
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+        val emitter = elem.emitterScala.get
+        if (elem.needsPostProcess2) {
+          emitter.emitPostProcInit2(quote(sym), "__act")
+        }
+      case (sym, elem: DeliteCollectElem[_,_]) =>
+        val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+        if (elem.needsPostProcess2) {
+          emitter.emitPostProcInit2(quote(sym), "__act")
+        }
+      case (sym, elem: DeliteForeachElem[_]) =>
+      case (sym, elem: DeliteReduceElem[_]) =>
+      case (sym, elem: DeliteReduceTupleElem[_,_]) =>
+    }
+    stream.println(/*{*/"}")
+    stream.println("def postProcess2(__act: " + actType + "): Unit = {"/*}*/)
+    (symList zip op.body) foreach {
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+        val emitter = elem.emitterScala.get
+        if (elem.needsPostProcess2) {
+          //calculate start offset from rhs.offset + rhs.size
+          emitter.emitPostProcess2(quote(sym), "__act")
+        }
+      case (sym, elem: DeliteCollectElem[_,_]) =>
+        val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+        if (elem.needsPostProcess2) {
+          //calculate start offset from rhs.offset + rhs.size
+          emitter.emitPostProcess2(quote(sym), "__act")
+        }
+      case (sym, elem: DeliteForeachElem[_]) =>
+      case (sym, elem: DeliteReduceElem[_]) =>
+      case (sym, elem: DeliteReduceTupleElem[_,_]) =>
+    }
+    stream.println(/*{*/"}")
+    
+    stream.println("def finalize(__act: " + actType + "): Unit = {"/*}*/)
+    (symList zip op.body) foreach {
+      case (sym, elem: DeliteHashElem[_,_,_,_]) =>
+        elem.emitterFactory.map(_.scala).get.emitDataDeclaration(elemType(elem), quote(sym), "__act.", quote(sym) + "_data")
+        stream.println("val " + quote(sym) + " = {")
+        emitBlock(elem.alloc)
+        elem.emitterFactory.get.scala.emitInitializeDataStructure(quote(sym), "__act.", quote(getBlockResult(elem.alloc)), quote(sym) + "_data")
+        stream.println("}")
+      case (sym, elem: DeliteCollectElem[_,_]) =>
+        val emitter = elem.emitterScala.getOrElse(standardScalaEmitter)
+        elem.emitterFactory.map(_.scala).getOrElse(standardScalaEmitter).emitDataDeclaration(elemType(elem), quote(sym), "__act.", quote(elem.aV), remap(elem.aV.Type))
+        stream.println("__act." + quote(sym) + " = {"/*}*/)
+        if (elem.emitterScala.isEmpty) {
+          emitBlock(elem.alloc)
+          stream.println(quote(getBlockResult(elem.alloc)))
+        } else {
+          emitBlock(elem.allocDataStructure)
+          emitter.emitInitializeDataStructure(quote(sym), "__act.", quote(getBlockResult(elem.allocDataStructure)), quote(elem.aV))
+        }
+        stream.println(/*{*/"}")
+      case (sym, elem: DeliteForeachElem[_]) =>
+      case (sym, elem: DeliteReduceElem[_]) =>
+      case (sym, elem: DeliteReduceTupleElem[_,_]) =>
+    }
+    stream.println(/*{*/"}")
+    
     stream.println(/*{*/"}")
     //deliteKernel = true
   }

@@ -5,12 +5,11 @@ import java.io.PrintWriter
 import ppl.dsl.deliszt._
 import ppl.dsl.deliszt.MetaInteger._
 
-import ppl.delite.framework.DSLType
 import scala.virtualization.lms.common._
 import scala.virtualization.lms.internal.GenericFatCodegen
 import ppl.dsl.deliszt.{DeLisztExp, DeLiszt}
 
-trait VecOps extends DSLType with Variables {
+trait VecOps extends Variables {
   this: DeLiszt =>
 
   object Vec {
@@ -126,7 +125,7 @@ trait VecOps extends DSLType with Variables {
 trait VecOpsExp extends VecOps with VariablesExp with BaseFatExp {
   this: VecImplOps with DeLisztExp =>
 
-  override def reflectPure[A:Manifest](x: Def[A]): Exp[A] = toAtom(x) // TODO: just to make refactoring easier in case we want to change to reflectSomething
+  //override def reflectPure[A:Manifest](x: Def[A]): Exp[A] = toAtom(x) // TODO: just to make refactoring easier in case we want to change to reflectSomething
 
   ///////////////////////////////////////////////////
   // implemented via method on real data structure

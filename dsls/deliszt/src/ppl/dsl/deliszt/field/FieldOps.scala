@@ -4,13 +4,12 @@ import java.io.PrintWriter
 import ppl.dsl.deliszt.capabilities._
 import ppl.dsl.deliszt._
 
-import ppl.delite.framework.DSLType
 import reflect.Manifest
 import scala.virtualization.lms.common._
 import scala.virtualization.lms.util.OverloadHack
 import scala.virtualization.lms.internal.{GenericFatCodegen, GenerationFailedException}
 
-trait FieldOps extends DSLType with Variables with OverloadHack {
+trait FieldOps extends Variables with OverloadHack {
   this: DeLiszt =>
 
   implicit def repFieldToFieldOps[MO <: MeshObj:Manifest, T : Manifest](x: Rep[Field[MO, T]]) = new fieldOpsCls[MO,T](x)
@@ -61,7 +60,7 @@ trait FieldOps extends DSLType with Variables with OverloadHack {
 trait FieldOpsExp extends FieldOps with VariablesExp with BaseFatExp {
   this: DeLisztExp with FieldImplOps =>
 
-  def reflectPure[T:Manifest](x: Def[T]): Exp[T] = toAtom(x) // TODO: just to make refactoring easier in case we want to change to reflectSomething
+  //def reflectPure[T:Manifest](x: Def[T]): Exp[T] = toAtom(x) // TODO: just to make refactoring easier in case we want to change to reflectSomething
 
   ///////////////////////////////////////////////////
   // implemented via method on real data structure  

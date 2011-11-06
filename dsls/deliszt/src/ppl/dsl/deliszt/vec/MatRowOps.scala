@@ -1,7 +1,6 @@
 package ppl.dsl.deliszt.vec
 
 import java.io.PrintWriter
-import ppl.delite.framework.DSLType
 import scala.virtualization.lms.common._
 import scala.virtualization.lms.util.OverloadHack
 import ppl.dsl.deliszt.{DeLiszt, DeLisztExp}
@@ -14,7 +13,7 @@ import ppl.dsl.deliszt.MetaInteger._
 
 // perhaps we allow this only for Streams (where you can't use the index to do anything bad)
 // however, as long as we don't provide access to the underlying mat, it is still relatively constrained...
-trait MatRowOps extends DSLType with Variables { this: DeLiszt =>
+trait MatRowOps extends Variables { this: DeLiszt =>
   def infix_index[C<:IntM,A:Manifest](x: Rep[MatRow[C,A]]) = matrow_index(x)
 
   // class defs

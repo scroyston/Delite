@@ -24,3 +24,5 @@ benchmark/times
 test-out/*/*-log
 test-out/*/*-skel
 test-out/*/*-src
+*~
+scripts/setupenv

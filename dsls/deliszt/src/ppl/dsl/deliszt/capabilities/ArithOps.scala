@@ -5,6 +5,7 @@ import java.io.PrintWriter
 import scala.virtualization.lms.common._
 import scala.virtualization.lms.internal.{CLikeCodegen}
 import scala.virtualization.lms.util.OverloadHack
+import scala.reflect.{Manifest, SourceContext}
 
 import ppl.dsl.deliszt._
 import ppl.dsl.deliszt.MetaInteger._
@@ -197,7 +198,7 @@ trait ArithOpsExp extends ArithOps with VariablesExp {
   def arith_abs[T: Manifest : Numeric](lhs: Exp[T]) = ArithAbs(lhs)
   def arith_exp[T: Manifest : Numeric](lhs: Exp[T]) = ArithExp(lhs)
 
-  override def mirror[A: Manifest](e: Def[A], f: Transformer): Exp[A] = {
+  override def mirror[A: Manifest](e: Def[A], f: Transformer)(implicit ctx: SourceContext): Exp[A] = {
     implicit var a: Fractional[A] = null // hack!! need to store it in Def instances??
     e match {
       case ArithPlus(lhs, rhs) => arith_plus(f(lhs), f(rhs))

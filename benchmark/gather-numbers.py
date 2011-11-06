@@ -47,6 +47,7 @@ def main():
     parser.add_option("--stats-dir", dest="stats_dir", default=None, help="allows you to specify a different statistics output directory. environment variables are interpolated")
     parser.add_option("--timestamp", dest="stats_time", action="store_true", help="store statistics under a timestamped directory")
     parser.add_option("-d", "--datasets", dest="datasets", default=None, help="allows you to specify a different datasets file to use. otherwise defaults to benchmark/config/datasets.HOSTNAME.INPUT_SIZE")
+    parser.add_option("--hprof", dest="hprof", action="store_true", help="enables hprof")
 
     (opts, args) = parser.parse_args()
     if len(args) != 0:
@@ -95,7 +96,9 @@ def loadOptions(opts):
     
     if opts.datasets:
       options['datasets'] = opts.datasets
-      
+
+    options['hprof'] = opts.hprof
+  
     #set delite home
     if(opts.delite_home != "_env"):
         props["delite.home"] = opts.delite_home
@@ -161,18 +164,21 @@ def launchApps(options):
         java_opts = os.getenv("JAVA_OPTS", "")
         build_dir = props["delite.home"] + "/generated/"
         opts = " -Ddelite.home.dir=" + props["delite.home"] + " -Ddelite.build.dir=" + build_dir + " -Ddelite.deg.filename=" + app + ".deg"
-        if options['blas'] == True:
-            opts = opts + " -Dblas.enabled"
-        if options['run']['gpu'] == True:
-            opts = opts + " -Ddelite.generation.cuda"
-        if options['variants'] == False:
-            opts = opts + " -Dnested.variants.level=0"
-        if options['fusion'] == True:
-            opts = opts + " -Ddelite.opfusion.enabled=true"
+
         if options['stencil'] == True:
             opts = opts + " -Dliszt.stencil.enabled=true"
         if options['print_globals'] == True:
             opts = opts + " -Ddelite.print_globals.enabled=true"
+        if options['blas'] == True:
+            opts = opts + " -Ddelite.extern.blas"
+        if options['run']['gpu'] == True:
+            opts = opts + " -Ddelite.generate.cuda"
+        if options['variants'] == False:
+            opts = opts + " -Dnested.variants.level=0"
+        if options['hprof'] == True:
+            opts += " -agentlib:hprof=cpu=samples,depth=10,file=" + app + ".hprof"
+        if options['fusion'] == False:
+            opts = opts + " -Ddelite.enable.fusion=false"
         opts = opts + " " + java_opts
         os.putenv("JAVA_OPTS", opts)
         os.putenv("GEN_OPTS", opts)
@@ -277,7 +283,7 @@ def loadParams(options):
     f.close()
  
 def expand(param):
-    if (param[0] == '$'):
+    if (len(param) > 0 and param[0] == '$'):
         return props['apps.data'] + "/" +  param[1:len(param)]
     else:
         return param   

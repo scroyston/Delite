@@ -2,14 +2,14 @@ package ppl.dsl.deliszt.intm
 
 import java.io.{PrintWriter}
 
-import ppl.delite.framework.{DeliteApplication, DSLType}
+import ppl.delite.framework.{DeliteApplication}
 import scala.virtualization.lms.common.DSLOpsExp
 import scala.virtualization.lms.common.{VariablesExp, Variables}
 import scala.virtualization.lms.common.{CudaGenBase, ScalaGenBase, CGenBase}
 import ppl.dsl.deliszt._
 import ppl.dsl.deliszt.MetaInteger._
 
-trait IntMOps extends DSLType with Variables {
+trait IntMOps extends Variables {
   this: DeLiszt =>
 
   /* val _0 = intm_obj[_0]

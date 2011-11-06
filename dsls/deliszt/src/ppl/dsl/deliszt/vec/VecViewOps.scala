@@ -1,13 +1,12 @@
 package ppl.dsl.deliszt.vec
 
 import java.io.PrintWriter
-import ppl.delite.framework.DSLType
 import scala.virtualization.lms.util.OverloadHack
 import scala.virtualization.lms.common.{BaseExp, Base, ScalaGenBase}
 import ppl.delite.framework.ops.DeliteOpsExp
 import ppl.dsl.deliszt.VecView
 
-trait VecViewOps extends DSLType with Base with OverloadHack {
+trait VecViewOps extends Base with OverloadHack {
 }
 
 trait VecViewOpsExp extends VecViewOps with BaseExp { this: DeliteOpsExp =>

@@ -2,7 +2,7 @@ package ppl.dsl.deliszt.mat
 
 import java.io.{PrintWriter}
 
-import ppl.delite.framework.{DeliteApplication,DSLType}
+import ppl.delite.framework.{DeliteApplication}
 import scala.virtualization.lms.common._
 import scala.virtualization.lms.internal.{GenerationFailedException}
 
@@ -13,7 +13,7 @@ import ppl.dsl.deliszt.{DeLisztExp,DeLiszt}
 import ppl.dsl.deliszt._
 import ppl.dsl.deliszt.MetaInteger._
 
-trait MatOps extends DSLType with Variables {
+trait MatOps extends Variables {
   this: DeLiszt =>
 
   object Mat {

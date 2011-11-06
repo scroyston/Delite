@@ -3,8 +3,30 @@ package ppl.dsl.optiql.datastruct.scala.container
 import collection.mutable.ArrayBuffer
 import collection.mutable.{ArrayBuffer, HashMap, Buffer}
 import ppl.dsl.optiql.datastruct.scala.util.{ReflectionHelper, Date}
+import ppl.dsl.optiql.datastruct.scala.ordering._
+import ppl.delite.framework.datastruct.scala._
 
 object DataTable {
+
+  def convertHashMapToDataTable[T:Manifest,K](hm: ppl.delite.framework.datastruct.scala.HashMap[K,Bucket[T]]): DataTable[Grouping[K,T]] = {     
+    val result = new DataTable[Grouping[K,T]] {
+      override def addRecord(fields: Array[String]) = throw new RuntimeException("Cannot add records to a grouping table")
+      override val grouped = true
+    }
+    val hmSize = hm.unsafeSize
+    val keys = hm.unsafeKeys
+    val values = hm.unsafeValues
+    var idx = 0
+    while(idx < hmSize) {
+      //println("key: " + keys(idx) + " | bucket: " + values(idx))    
+      val nArraySz = values(idx).size
+      val nArrayBuf = new UnsafeArrayBuffer[T]()
+      nArrayBuf.unsafeSetData(values(idx).array, nArraySz)
+      result._data += new Grouping(keys(idx), nArrayBuf)    
+      idx +=1
+    }
+    result
+  }
 
   implicit def convertIterableToDataTable[T](i: Iterable[T]) : DataTable[T] = {
     if(i.isInstanceOf[DataTable[T]]) {
@@ -25,10 +47,11 @@ object DataTable {
 	else if(i.isInstanceOf[Grouping[_,T]]) {
 	  println("converting grouping to DataTable")
 	  val g = i.asInstanceOf[Grouping[_,T]]
-	  assert(g.elems.isInstanceOf[UnsafeArrayBuffer[T]])
 	  return new DataTable[T] {
 
-        _data = g.elems.asInstanceOf[UnsafeArrayBuffer[T]]
+        _data = if(g.elems.isInstanceOf[UnsafeArrayBuffer[T]]) 
+                  g.elems.asInstanceOf[UnsafeArrayBuffer[T]] 
+                else sys.error("Grouping elems not supported " + g.elems)
 
         override def addRecord(arr: Array[String]) {
           throw new RuntimeException("Cannot add Record into a projected DataTable")
@@ -37,6 +60,7 @@ object DataTable {
 	  
 	}
     else {
+      println("WARNING: no appropriate type found for initial data, going the slow route of appedning one item at a time")
       val arrbuf = new UnsafeArrayBuffer[T]
       
       for (e <- i) {
@@ -89,7 +113,7 @@ class DataTable[TSource](initialSize: Int) extends Iterable[TSource] with ppl.de
   }
   def dcSize = _data.size
   def unsafeSetData(arr: Array[TSource], size: Int) = _data.unsafeSetData(arr.asInstanceOf[Array[AnyRef]], size)
-  def data = _data.getArray
+  def data = _data.getArray.asInstanceOf[Array[TSource]]
   
   def this() = this(0)
 	
@@ -132,7 +156,7 @@ class DataTable[TSource](initialSize: Int) extends Iterable[TSource] with ppl.de
 
   //todo clean this up
   //for example, I can use reflection to generate the metadata that I need to print the table
-  def printAsTable() {
+  def printAsTable(max_rows: Int = 100) {
 
     // Check if Table is empty
     if(_data.size == 0) {
@@ -147,7 +171,7 @@ class DataTable[TSource](initialSize: Int) extends Iterable[TSource] with ppl.de
     if(grouped) {
       handleGroupedTable
     } else {
-      handleNormalTable
+      handleNormalTable(max_rows)
     }
 
   }
@@ -157,12 +181,12 @@ class DataTable[TSource](initialSize: Int) extends Iterable[TSource] with ppl.de
       val group = key.asInstanceOf[Grouping[_,_]]
       println("Key = " + group.key)
       val table = convertIterableToDataTable(group.elems)
-      table.printAsTable
+      table.printAsTable(100)
     }
 
   }
 
-  private def handleNormalTable() {
+  private def handleNormalTable(rows: Int = 0) {
     implicit val tableStr = new StringBuilder
     val columnSizes = getTableColSizes()
 
@@ -189,11 +213,13 @@ class DataTable[TSource](initialSize: Int) extends Iterable[TSource] with ppl.de
     print(tableStr.toString)
     tableStr.clear
 
-    for(r <- 0 until _data.size) {
+    val size = if(rows != 0 && rows < data.size) rows else data.size
+    for(r <- 0 until size) {
       emitRecordAsRow(r, columnSizes)
     }
     print(tableStr.toString)
     tableStr.clear
+
 
     horizontalRule
     println(tableStr.toString)
@@ -278,6 +304,77 @@ class DataTable[TSource](initialSize: Int) extends Iterable[TSource] with ppl.de
     }
     sum
   }
+  
+  def Min[@specialized T:Numeric, TS](selector: TSource => T): TSource = {
+    val n = implicitly[Numeric[T]]
+    import n._
+    if(_data.size == 0) return null.asInstanceOf[TSource]
+    var min = _data(0)
+    for(e <- _data) {
+      if(selector(min) > selector(e))
+        min = e
+    }
+    min
+  }
+  
+  
+  
+  
+  
+  def OrderBy[TKey](keySelector: TSource => TKey)(implicit comparer: Ordering[TKey]) = {
+    new OrderedQueryable(this, new ProjectionComparer(keySelector))       
+  }
+      
+  def OrderByDescending[TKey](keySelector: TSource => TKey)(implicit comparer: Ordering[TKey]) = {
+    new OrderedQueryable(this, new ReverseComparer(new ProjectionComparer(keySelector)))       
+  }
+  
+  def Join[TSecond](second: DataTable[TSecond]) = new JoinableOps(this, second)
+
+  class JoinableOps[TFirst, TSecond](first: DataTable[TFirst], second: DataTable[TSecond]) {
+    def WhereEq[TKey2](firstKeySelector: TFirst => TKey2,secondKeySelector: TSecond => TKey2) = new Joinable2(first, second, firstKeySelector, secondKeySelector)
+  }
+
+  class Joinable2[TFirst, TSecond, TKey2](val first: DataTable[TFirst],
+                                          val second: DataTable[TSecond],
+                                          val firstKeySelector: TFirst => TKey2,
+                                          val secondKeySelector: TSecond => TKey2) {
+    
+    def preJoin():(ArrayBuffer[TFirst], ArrayBuffer[TSecond]) = {
+      //join first two
+      val (hashTable, _) = buildHash(first, firstKeySelector)
+      val firsts = new ArrayBuffer[TFirst]
+      val seconds = new ArrayBuffer[TSecond]
+      
+      //PerformanceTimer.start("match", false)
+      for(row <- second) {
+        val tryjoin = hashTable.getOrElse(secondKeySelector(row), null)
+        if(tryjoin != null)
+          for(e <- tryjoin) {
+            firsts.append(e)
+            seconds.append(row)
+          }
+      }
+      //PerformanceTimer.stop("match", false)
+      (firsts, seconds)
+    }
+    def Select[TResult](resultSelector: (TFirst, TSecond) => TResult) = {
+      val (firsts, seconds) = preJoin()
+      val result = new DataTable[TResult] {
+        override def addRecord(fields: Array[String]) = throw new RuntimeException("Cannot add records to joined table")
+      }
+      //PerformanceTimer.start("construct", false)
+      var idx = 0
+      while(idx < firsts.size) {
+        result._data.append(resultSelector(firsts(idx), seconds(idx)))
+        idx += 1
+      }
+      //PerformanceTimer.stop("construct", false)
+      result
+    }
+  }
+  
+
   
   /*****
    * Internal Implementation functions
